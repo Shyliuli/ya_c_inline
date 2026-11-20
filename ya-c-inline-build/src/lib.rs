@@ -287,6 +287,8 @@ fn discover_capture_names(body: &str, dir: &Path) -> Vec<(String, bool)> {
         let output = Command::new(clang())
             .arg("-Xclang")
             .arg("-ast-dump")
+            .arg("-Xclang")
+            .arg("-ast-dump-filter=__yaci_names")
             .arg("-fsyntax-only")
             .arg("-ferror-limit=0")
             .arg("-I")
@@ -344,7 +346,7 @@ fn augment_body(body: &str, names: &[(String, bool)], types: &HashMap<String, St
         let ty = types.get(name).unwrap_or_else(|| {
             panic!(
                 "rust-analyzer cannot resolve the type of captured variable `{}`; \
-                 run `cargo build` once to generate bindings, then rebuild",
+                 generate any Rust bindings it uses before calling ya_c_inline_build::setup()",
                 name
             )
         });
@@ -446,25 +448,6 @@ fn setup_with(always_inline: bool) {
         )
         .unwrap();
 
-        let bindings = bindgen::Builder::default()
-            .header(header.to_string_lossy())
-            .clang_arg(format!("-I{}", yaci.display()))
-            .generate_comments(false)
-            .layout_tests(false)
-            .generate()
-            .unwrap_or_else(|e| panic!("bindgen failed for cmod! {}: {}", h, e));
-        let mut generated = Vec::new();
-        bindings.write(Box::new(&mut generated) as Box<dyn std::io::Write>).unwrap();
-        let generated = String::from_utf8(generated).unwrap();
-        fs::write(
-            mods.join(format!("{}.rs", h)),
-            format!(
-                "#[allow(non_camel_case_types, non_upper_case_globals, non_snake_case, dead_code, improper_ctypes, unnecessary_transmutes)]\nmod __yaci_bindings {{\n{}\n}}\npub use __yaci_bindings::*;\n",
-                generated
-            ),
-        )
-        .unwrap();
-
         let csrc = mods.join(format!("{}.c", h));
         fs::write(
             &csrc,
@@ -479,16 +462,24 @@ fn setup_with(always_inline: bool) {
     fs::write(yaci.join("yaci_all_mods.h"), all_mods).unwrap();
 
     let stmt_macros = dedup_stmts(collector.stmts);
-    let mut lsp = Lsp::new(&manifest);
-    for (path, text) in &collector.files {
-        lsp.did_open(path, text);
-    }
-    std::thread::sleep(std::time::Duration::from_millis(300));
+    let mut lsp = None;
     for stmt in &stmt_macros {
         let h = hash(&stmt.key);
         let names = discover_capture_names(&stmt.source, &stmts);
-        let types = lsp.completion_types(&stmt.file, stmt.line, stmt.column);
-        let mut body = augment_body(&stmt.source, &names, &types);
+        let mut body = if names.is_empty() {
+            stmt.source.clone()
+        } else {
+            let lsp = lsp.get_or_insert_with(|| {
+                let mut lsp = Lsp::new(&manifest);
+                for (path, text) in &collector.files {
+                    lsp.did_open(path, text);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                lsp
+            });
+            let types = lsp.completion_types(&stmt.file, stmt.line, stmt.column);
+            augment_body(&stmt.source, &names, &types)
+        };
         let ret_ty = infer_return_type(&stmt.file, stmt.line, stmt.column);
         if let Some(ty) = ret_ty {
             body = format!("YACI_RETURN({});\n{}", rust_type_to_c(&ty), body);
@@ -719,6 +710,7 @@ fn compile_static(dir: &Path, lib: &str, csrc: &Path) {
         {
             let mut cmd = Command::new(clang());
             cmd.arg("-O2")
+                .arg("-fPIC")
                 .arg("-c")
                 .arg(csrc)
                 .arg("-I")
@@ -856,6 +848,8 @@ fn discover(probe: &Path, dir: &Path) -> (Vec<Capture>, Option<String>) {
     let mut cmd = Command::new(clang());
     cmd.arg("-Xclang")
         .arg("-ast-dump")
+        .arg("-Xclang")
+        .arg("-ast-dump-filter=__yaci_probe")
         .arg("-fsyntax-only")
         .arg("-ferror-limit=0")
         .arg("-I")

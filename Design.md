@@ -15,7 +15,7 @@ cmod!{
 
 ## 1.2 基本原理
 原地生成桩函数，将C部分通过clang编译为ir，通过always inline pass进入rust ir.
-函数声明，结构体声明等走binding+extern "C"
+需要直接从 Rust 使用的函数和结构体由调用方自行生成绑定。
 应当支持同名结构体和它的指针，支持cmod定义的函数被rust调用，支持调用rust的[unsafe(no_mangle)]extern "C"的函数
 变量捕获：通过clang可以获得变量名，通过rust-analyzer可以获取变量与类型，通过构造对应指针传入(同时符合rust的所有权机制，如果无法原地构造&mut,则只能传const T*)
 调用处需要写unsafe.
