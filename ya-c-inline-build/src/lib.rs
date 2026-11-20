@@ -784,7 +784,7 @@ fn compile_inlined_wrapper(
     fs::write(
         &wrapper_rs,
         format!(
-            "extern \"C\" {{\n    fn {}({}) -> {};\n}}\n#[no_mangle]\npub extern \"C\" fn {}({}) -> {} {{\n    unsafe {{ {}({}) }}\n}}\n",
+            "unsafe extern \"C\" {{\n    fn {}({}) -> {};\n}}\n#[no_mangle]\npub extern \"C\" fn {}({}) -> {} {{\n    unsafe {{ {}({}) }}\n}}\n",
             symbol,
             rust_params.join(", "),
             ret_rust,
@@ -1021,7 +1021,7 @@ fn generate_stmt(yaci: &Path, stmts: &Path, h: &str, body: &str, always_inline: 
     fs::write(
         stmts.join(format!("{}.rs", h)),
         format!(
-            "{{\n{}    extern \"C\" {{\n        fn {}({}) -> {};\n    }}\n    {}({})\n}}\n",
+            "{{\n{}    unsafe extern \"C\" {{\n        fn {}({}) -> {};\n    }}\n    {}({})\n}}\n",
             link_attr,
             symbol,
             rust_params.join(", "),
