@@ -1,0 +1,3 @@
+[workspace]
+members = ["ya-c-inline", "ya-c-inline-build", "tests"]
+resolver = "2"

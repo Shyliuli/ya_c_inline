@@ -1,0 +1,12 @@
+[package]
+name = "ya-c-inline"
+version = "0.1.0"
+edition = "2021"
+description = "Inline C in Rust with all C parsing delegated to clang"
+license = "MIT OR Apache-2.0"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1"
