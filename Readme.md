@@ -50,20 +50,15 @@ use ya_c_inline::{c, cinclude, cmod};
 
 cinclude! {
     #include <stdio.h>
-}
-
-cmod! {
-    int32_t add(int32_t a, int32_t b);
     typedef struct Point {
         int32_t x;
         int32_t y;
     } Point;
-    int32_t point_sum(Point p);
+}
 
-#ifdef YACI_CMOD_IMPL
+cmod! {
     int32_t add(int32_t a, int32_t b) { return a + b; }
     int32_t point_sum(Point p) { return p.x + p.y; }
-#endif
 }
 
 fn main() {
@@ -86,17 +81,7 @@ fn main() {
 
 #### `cmod! { ... }`
 
-用于函数外的 C 声明和定义。构建脚本将宏体编译成静态库，并让 `c!` 使用其中的声明。Rust 若要直接调用这些函数，请在自己的 `build.rs` 里用 bindgen 为所需的 C 头文件生成绑定，或手写 `extern "C"` 声明。
-
-若需要在 `cmod!` 中写函数定义，请用 `YACI_CMOD_IMPL` 守卫，避免多个翻译单元重复定义符号：
-
-```c
-int32_t add(int32_t a, int32_t b);
-
-#ifdef YACI_CMOD_IMPL
-int32_t add(int32_t a, int32_t b) { return a + b; }
-#endif
-```
+直接写 C 函数实现，不需要 `YACI_CMOD_IMPL`。构建脚本将实现编译成静态库，只把外部函数的声明提供给 `c!`。共享类型和宏放在 `cinclude!` 中。Rust 若要直接调用这些函数，请在自己的 `build.rs` 里用 bindgen 生成绑定，或手写 `extern "C"` 声明。
 
 #### `c! { ... }`
 

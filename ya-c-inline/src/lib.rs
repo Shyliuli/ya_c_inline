@@ -47,11 +47,11 @@ pub fn cinclude(_input: TokenStream) -> TokenStream {
     TokenStream::new()
 }
 
-/// 函数外的 C 声明/定义。构建脚本会将其编译为静态库。
+/// 函数外的 C 实现。构建脚本会将其编译为静态库。
 #[proc_macro]
 pub fn cmod(input: TokenStream) -> TokenStream {
     let h = ident(input.into());
-    let path = literal_path(&format!("mods/{}.h", h));
+    let path = literal_path(&format!("mods/{}.c", h));
     format!("const _: &str = include_str!({path});")
         .parse()
         .expect("generated include is valid Rust")

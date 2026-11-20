@@ -279,7 +279,7 @@ fn discover_capture_names(body: &str, dir: &Path) -> Vec<(String, bool)> {
         fs::write(
             &probe,
             format!(
-                "#include \"yaci_includes.h\"\n#include \"yaci_probe_prelude.h\"\n#include \"yaci_all_mods.h\"\nint __yaci_names(void) {{\n{}{}\nreturn 0;\n}}\n",
+                "#include \"yaci_includes.h\"\n#include \"yaci_probe_prelude.h\"\n#include \"yaci_cmod_decls.h\"\nint __yaci_names(void) {{\n{}{}\nreturn 0;\n}}\n",
                 decls, body
             ),
         )
@@ -438,28 +438,18 @@ fn setup_with(always_inline: bool) {
     .unwrap();
 
     let cmods = dedup(collector.cmods);
-    let mut all_mods = String::from("#pragma once\n");
+    let mut declarations = String::from("#pragma once\n");
     for (key, body) in &cmods {
         let h = hash(key);
-        let header = mods.join(format!("{}.h", h));
-        fs::write(
-            &header,
-            format!("#pragma once\n#include \"yaci_includes.h\"\n{}\n", body),
-        )
-        .unwrap();
-
         let csrc = mods.join(format!("{}.c", h));
-        fs::write(
-            &csrc,
-            format!("#define YACI_CMOD_IMPL\n#include \"{}.h\"\n", h),
-        )
-        .unwrap();
+        let source = format!("#define YACI_CMOD_IMPL\n#include \"yaci_includes.h\"\n{body}\n");
+        fs::write(&csrc, &source).unwrap();
+        declarations.push_str(&cmod_declarations(&yaci, &csrc, &source));
         let lib = format!("yaci_m_{}", h);
         compile_static(&yaci, &lib, &csrc);
         println!("cargo:rustc-link-lib=static:+whole-archive={}", lib);
-        all_mods.push_str(&format!("#include \"mods/{}.h\"\n", h));
     }
-    fs::write(yaci.join("yaci_all_mods.h"), all_mods).unwrap();
+    fs::write(yaci.join("yaci_cmod_decls.h"), declarations).unwrap();
 
     let stmt_macros = dedup_stmts(collector.stmts);
     let mut lsp = None;
@@ -702,6 +692,47 @@ fn run(mut cmd: Command, what: &str) -> Output {
         );
     }
     output
+}
+
+fn cmod_declarations(dir: &Path, csrc: &Path, source: &str) -> String {
+    let mut cmd = Command::new(clang());
+    cmd.args(["-Xclang", "-ast-dump=json", "-fsyntax-only", "-I"])
+        .arg(dir)
+        .arg(csrc);
+    let output = run(cmd, "clang AST dump for cmod!");
+    let ast: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let items = ast["inner"].as_array().unwrap();
+    let private_functions: HashSet<_> = items
+        .iter()
+        .filter(|item| item["kind"] == "FunctionDecl" && item["storageClass"] == "static")
+        .filter_map(|item| item["name"].as_str())
+        .collect();
+    let mut declarations = String::new();
+    for item in items.iter().filter(|item| item["kind"] == "FunctionDecl") {
+        let name = item["name"].as_str().unwrap();
+        let loc = item["loc"].get("expansionLoc").unwrap_or(&item["loc"]);
+        if private_functions.contains(name) || loc["offset"].is_null() || !loc["includedFrom"].is_null() {
+            continue;
+        }
+        let Some(body) = item["inner"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|child| child["kind"] == "CompoundStmt")
+        else {
+            continue;
+        };
+        let start = item["range"]["begin"]["offset"].as_u64();
+        let end = body["range"]["begin"]["offset"].as_u64();
+        if let (Some(start), Some(end)) = (start, end) {
+            declarations.push_str(source[start as usize..end as usize].trim_end());
+            declarations.push_str(";\n");
+        } else {
+            let ty = item["type"]["qualType"].as_str().unwrap();
+            declarations.push_str(&format!("extern __typeof__({ty}) {name};\n"));
+        }
+    }
+    declarations
 }
 
 fn compile_static(dir: &Path, lib: &str, csrc: &Path) {
@@ -949,7 +980,7 @@ fn generate_stmt(yaci: &Path, stmts: &Path, h: &str, body: &str, always_inline: 
     fs::write(
         &probe,
         format!(
-            "#include \"yaci_includes.h\"\n#include \"yaci_probe_prelude.h\"\n#include \"yaci_all_mods.h\"\nint __yaci_probe(void) {{\n{}\nreturn 0;\n}}\n",
+            "#include \"yaci_includes.h\"\n#include \"yaci_probe_prelude.h\"\n#include \"yaci_cmod_decls.h\"\nint __yaci_probe(void) {{\n{}\nreturn 0;\n}}\n",
             body
         ),
     )
@@ -987,7 +1018,7 @@ fn generate_stmt(yaci: &Path, stmts: &Path, h: &str, body: &str, always_inline: 
     fs::write(
         &csrc,
         format!(
-            "#include \"yaci_includes.h\"\n#include \"yaci_final_prelude.h\"\n#include \"yaci_all_mods.h\"\n{}{} __yaci_stmt_{}({}) {{\n{}{}{}}}\n",
+            "#include \"yaci_includes.h\"\n#include \"yaci_final_prelude.h\"\n#include \"yaci_cmod_decls.h\"\n{}{} __yaci_stmt_{}({}) {{\n{}{}{}}}\n",
             attr,
             ret_c,
             h,
