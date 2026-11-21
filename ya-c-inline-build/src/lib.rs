@@ -407,14 +407,13 @@ fn setup_with(always_inline: bool) {
     collect_macros(&manifest.join("src"), &mut collector);
 
     let includes = collector.includes.join("\n");
-    fs::write(
-        yaci.join("yaci_includes.h"),
-        format!(
+    write_if_changed(
+        &yaci.join("yaci_includes.h"),
+        &format!(
             "#pragma once\n#include <stdint.h>\n#include <stddef.h>\n#include <stdbool.h>\n{}\n",
             includes
         ),
-    )
-    .unwrap();
+    );
 
     fs::write(
         yaci.join("yaci_probe_prelude.h"),
@@ -426,16 +425,15 @@ fn setup_with(always_inline: bool) {
         ),
     )
     .unwrap();
-    fs::write(
-        yaci.join("yaci_final_prelude.h"),
+    write_if_changed(
+        &yaci.join("yaci_final_prelude.h"),
         concat!(
             "#pragma once\n",
             "#define YACI_CAPTURE(type, name)\n",
             "#define YACI_CAPTURE_MUT(type, name)\n",
             "#define YACI_RETURN(type)\n",
         ),
-    )
-    .unwrap();
+    );
 
     let cmods = dedup(collector.cmods);
     let mut declarations = String::from("#pragma once\n");
@@ -443,13 +441,13 @@ fn setup_with(always_inline: bool) {
         let h = hash(key);
         let csrc = mods.join(format!("{}.c", h));
         let source = format!("#define YACI_CMOD_IMPL\n#include \"yaci_includes.h\"\n{body}\n");
-        fs::write(&csrc, &source).unwrap();
+        write_if_changed(&csrc, &source);
         declarations.push_str(&cmod_declarations(&yaci, &csrc, &source));
         let lib = format!("yaci_m_{}", h);
         compile_static(&yaci, &lib, &csrc);
         println!("cargo:rustc-link-lib=static:+whole-archive={}", lib);
     }
-    fs::write(yaci.join("yaci_cmod_decls.h"), declarations).unwrap();
+    write_if_changed(&yaci.join("yaci_cmod_decls.h"), &declarations);
 
     let stmt_macros = dedup_stmts(collector.stmts);
     for stmt in &stmt_macros {
@@ -556,6 +554,48 @@ fn hash(s: &str) -> String {
         h = h.wrapping_mul(0x100000001b3);
     }
     format!("{:016x}", h)
+}
+
+fn write_if_changed(path: &Path, contents: &str) {
+    if fs::read(path).ok().as_deref() != Some(contents.as_bytes()) {
+        fs::write(path, contents).unwrap();
+    }
+}
+
+fn is_fresh(output: &Path, inputs: &[&Path], depfile: &Path) -> bool {
+    if !depfile.exists() {
+        return false;
+    }
+    let Ok(output_time) = fs::metadata(output).and_then(|metadata| metadata.modified()) else {
+        return false;
+    };
+    let dependencies = dependencies(depfile);
+    let mut fresh = true;
+    for path in inputs
+        .iter()
+        .copied()
+        .chain(dependencies.iter().map(PathBuf::as_path))
+    {
+        println!("cargo:rerun-if-changed={}", path.display());
+        fresh &= fs::metadata(path)
+            .and_then(|metadata| metadata.modified())
+            .is_ok_and(|modified| modified <= output_time);
+    }
+    fresh
+}
+
+fn dependencies(depfile: &Path) -> Vec<PathBuf> {
+    let Ok(contents) = fs::read_to_string(depfile) else {
+        return Vec::new();
+    };
+    let contents = contents.replace("\\\n", "").replace("\\ ", "\0");
+    let Some((_, paths)) = contents.split_once(':') else {
+        return Vec::new();
+    };
+    paths
+        .split_whitespace()
+        .map(|path| PathBuf::from(path.replace('\0', " ")))
+        .collect()
 }
 
 fn tokens_to_c(ts: TokenStream2) -> String {
@@ -746,11 +786,19 @@ fn cmod_declarations(dir: &Path, csrc: &Path, source: &str) -> String {
 
 fn compile_static(dir: &Path, lib: &str, csrc: &Path) {
     let obj = dir.join(format!("{}.o", lib));
+    let archive = dir.join(format!("lib{}.a", lib));
+    let depfile = dir.join(format!("{}.d", lib));
+    if is_fresh(&archive, &[csrc, &obj], &depfile) {
+        return;
+    }
     run(
         {
             let mut cmd = Command::new(clang());
             cmd.arg("-O2")
                 .arg("-fPIC")
+                .arg("-MMD")
+                .arg("-MF")
+                .arg(&depfile)
                 .arg("-c")
                 .arg(csrc)
                 .arg("-I")
@@ -761,7 +809,6 @@ fn compile_static(dir: &Path, lib: &str, csrc: &Path) {
         },
         "clang -c",
     );
-    let archive = dir.join(format!("lib{}.a", lib));
     run(
         {
             let mut cmd = Command::new("ar");
@@ -774,12 +821,22 @@ fn compile_static(dir: &Path, lib: &str, csrc: &Path) {
 
 fn compile_bitcode(dir: &Path, name: &str, csrc: &Path) -> PathBuf {
     let bc = dir.join(format!("{}.bc", name));
+    let depfile = dir.join(format!("{}.d", name));
+    let includes = dir.join("yaci_includes.h");
+    let prelude = dir.join("yaci_final_prelude.h");
+    let declarations = dir.join("yaci_cmod_decls.h");
+    if is_fresh(&bc, &[csrc, &includes, &prelude, &declarations], &depfile) {
+        return bc;
+    }
     run(
         {
             let mut cmd = Command::new(clang());
             cmd.arg("-O2")
                 .arg("-flto")
                 .arg("-emit-llvm")
+                .arg("-MMD")
+                .arg("-MF")
+                .arg(&depfile)
                 .arg("-c")
                 .arg(csrc)
                 .arg("-I")
@@ -813,9 +870,9 @@ fn compile_inlined_wrapper(
     let symbol = format!("__yaci_stmt_{}", h);
     let rust_symbol = format!("__yaci_rust_{}", h);
     let wrapper_rs = stmts.join(format!("{}_wrapper.rs", h));
-    fs::write(
+    write_if_changed(
         &wrapper_rs,
-        format!(
+        &format!(
             "unsafe extern \"C\" {{\n    fn {}({}) -> {};\n}}\n#[no_mangle]\npub extern \"C\" fn {}({}) -> {} {{\n    unsafe {{ {}({}) }}\n}}\n",
             symbol,
             rust_params.join(", "),
@@ -826,8 +883,20 @@ fn compile_inlined_wrapper(
             symbol,
             names.join(", ")
         ),
-    )
-    .unwrap();
+    );
+
+    let object = stmts.join(format!("{}_wrapper.o", h));
+    let depfile = yaci.join(format!("yaci_s_{}.d", h));
+    let includes = yaci.join("yaci_includes.h");
+    let prelude = yaci.join("yaci_final_prelude.h");
+    let declarations = yaci.join("yaci_cmod_decls.h");
+    if is_fresh(
+        &object,
+        &[csrc, &wrapper_rs, &includes, &prelude, &declarations],
+        &depfile,
+    ) {
+        return object;
+    }
 
     let rust_bc = stmts.join(format!("{}_wrapper.bc", h));
     let mut rustc = Command::new("rustc");
@@ -868,7 +937,6 @@ fn compile_inlined_wrapper(
         },
         "opt -passes=always-inline",
     );
-    let object = stmts.join(format!("{}_wrapper.o", h));
     run(
         {
             let mut cmd = Command::new(tool("llc", "YA_C_INLINE_LLC"));
@@ -1024,9 +1092,9 @@ fn generate_stmt(yaci: &Path, stmts: &Path, h: &str, body: &str, always_inline: 
     } else {
         ""
     };
-    fs::write(
+    write_if_changed(
         &csrc,
-        format!(
+        &format!(
             "#include \"yaci_includes.h\"\n#include \"yaci_final_prelude.h\"\n#include \"yaci_cmod_decls.h\"\n{}{} __yaci_stmt_{}({}) {{\n{}{}{}}}\n",
             attr,
             ret_c,
@@ -1036,8 +1104,7 @@ fn generate_stmt(yaci: &Path, stmts: &Path, h: &str, body: &str, always_inline: 
             body,
             undefs
         ),
-    )
-    .unwrap();
+    );
 
     let lib = format!("yaci_s_{}", h);
     let (link_attr, symbol) = if always_inline {
