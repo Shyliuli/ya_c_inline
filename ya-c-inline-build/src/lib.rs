@@ -1,11 +1,10 @@
-use proc_macro2::{TokenStream as TokenStream2, TokenTree};
+use proc_macro2::{Delimiter, TokenStream as TokenStream2, TokenTree};
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
-use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Output, Stdio};
+use std::process::{Command, Output};
 use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
 
@@ -16,6 +15,12 @@ struct Capture {
     mutable: bool,
 }
 
+#[derive(Clone, Debug)]
+struct Signature {
+    captures: Vec<(String, String)>,
+    ret: Option<String>,
+}
+
 #[derive(Clone)]
 struct StmtMacro {
     key: String,
@@ -23,6 +28,7 @@ struct StmtMacro {
     file: PathBuf,
     line: usize,
     column: usize,
+    sig: Signature,
 }
 
 #[derive(Default)]
@@ -30,7 +36,6 @@ struct Collector {
     includes: Vec<String>,
     cmods: Vec<(String, String)>,
     stmts: Vec<StmtMacro>,
-    files: Vec<(PathBuf, String)>,
     file: PathBuf,
 }
 
@@ -43,21 +48,23 @@ impl<'ast> Visit<'ast> for Collector {
             .map(|seg| seg.ident.to_string())
             .unwrap_or_default();
         let key = canonical(m.tokens.clone());
-        let source = normalize_c(&tokens_to_c(m.tokens.clone()));
+        let (sig, body_tokens) = if name == "c" {
+            let (sig, body) = parse_signature(m.tokens.clone());
+            (sig, body)
+        } else {
+            (
+                Signature {
+                    captures: Vec::new(),
+                    ret: None,
+                },
+                m.tokens.clone(),
+            )
+        };
+        let source = normalize_c(&tokens_to_c(body_tokens));
         match name.as_str() {
             "cinclude" => self.includes.push(source),
             "cmod" => self.cmods.push((key, source)),
             "c" => {
-                if key.contains("iYACI_CAPTURE;")
-                    || key.contains("iYACI_CAPTURE_MUT;")
-                    || key.contains("iYACI_RETURN;")
-                {
-                    panic!(
-                        "explicit YACI_CAPTURE / YACI_RETURN are no longer supported; \
-                         capture types must be inferred by rust-analyzer and return types \
-                         must come from the Rust let-binding annotation"
-                    );
-                }
                 let start = m.path.span().start();
                 self.stmts.push(StmtMacro {
                     key,
@@ -65,142 +72,12 @@ impl<'ast> Visit<'ast> for Collector {
                     file: self.file.clone(),
                     line: start.line,
                     column: start.column,
+                    sig,
                 });
             }
             _ => {}
         }
         visit::visit_macro(self, m);
-    }
-}
-
-struct Lsp {
-    child: Child,
-    stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
-    next_id: u64,
-}
-
-impl Lsp {
-    fn new(root: &Path) -> Self {
-        let mut child = Command::new("rust-analyzer")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .current_dir(root)
-            .spawn()
-            .expect("failed to spawn rust-analyzer");
-        let stdin = child.stdin.take().unwrap();
-        let stdout = BufReader::new(child.stdout.take().unwrap());
-        let mut lsp = Self { child, stdin, stdout, next_id: 0 };
-        let root_uri = format!("file://{}", root.display());
-        lsp.send(serde_json::json!({
-            "jsonrpc": "2.0", "id": 1, "method": "initialize",
-            "params": {
-                "processId": std::process::id(),
-                "rootUri": root_uri,
-                "capabilities": {},
-                "workspaceFolders": [{"uri": root_uri, "name": "root"}]
-            }
-        }));
-        let _ = lsp.wait_for(1);
-        lsp.send(serde_json::json!({"jsonrpc":"2.0","method":"initialized","params":{}}));
-        lsp
-    }
-
-    fn send(&mut self, value: serde_json::Value) {
-        let data = serde_json::to_vec(&value).unwrap();
-        self.stdin.write_all(b"Content-Length: ").unwrap();
-        self.stdin.write_all(data.len().to_string().as_bytes()).unwrap();
-        self.stdin.write_all(b"\r\n\r\n").unwrap();
-        self.stdin.write_all(&data).unwrap();
-        self.stdin.flush().unwrap();
-    }
-
-    fn recv(&mut self) -> serde_json::Value {
-        let mut len = 0usize;
-        loop {
-            let mut line = String::new();
-            if self.stdout.read_line(&mut line).unwrap() == 0 {
-                panic!("rust-analyzer exited unexpectedly");
-            }
-            if line == "\r\n" {
-                break;
-            }
-            if let Some(v) = line.strip_prefix("Content-Length:") {
-                len = v.trim().parse().unwrap();
-            }
-        }
-        let mut buf = vec![0u8; len];
-        self.stdout.read_exact(&mut buf).unwrap();
-        serde_json::from_slice(&buf).unwrap()
-    }
-
-    fn wait_for(&mut self, id: u64) -> serde_json::Value {
-        loop {
-            let msg = self.recv();
-            if msg.get("id").and_then(serde_json::Value::as_u64) == Some(id) {
-                return msg.get("result").cloned().unwrap_or(serde_json::Value::Null);
-            }
-            if let (Some(method), Some(rid)) = (
-                msg.get("method").and_then(serde_json::Value::as_str),
-                msg.get("id"),
-            ) {
-                let result = if method == "workspace/configuration" {
-                    serde_json::json!([])
-                } else {
-                    serde_json::Value::Null
-                };
-                self.send(serde_json::json!({"jsonrpc":"2.0","id":rid,"result":result}));
-            }
-        }
-    }
-
-    fn request(&mut self, method: &str, params: serde_json::Value) -> serde_json::Value {
-        self.next_id += 1;
-        let id = self.next_id;
-        self.send(serde_json::json!({
-            "jsonrpc":"2.0", "id":id, "method":method, "params":params
-        }));
-        self.wait_for(id)
-    }
-
-    fn did_open(&mut self, path: &Path, text: &str) {
-        self.send(serde_json::json!({
-            "jsonrpc":"2.0", "method":"textDocument/didOpen",
-            "params":{"textDocument":{
-                "uri":format!("file://{}", path.display()),
-                "languageId":"rust", "version":1, "text":text
-            }}
-        }));
-    }
-
-    fn completion_types(&mut self, path: &Path, line: usize, column: usize) -> HashMap<String, String> {
-        let result = self.request("textDocument/completion", serde_json::json!({
-            "textDocument":{"uri":format!("file://{}", path.display())},
-            "position":{"line":line.saturating_sub(1), "character":column}
-        }));
-        let items = result.get("items").cloned().unwrap_or(result);
-        let mut map = HashMap::new();
-        if let Some(arr) = items.as_array() {
-            for item in arr {
-                if item.get("kind").and_then(serde_json::Value::as_u64) != Some(6) {
-                    continue;
-                }
-                if let (Some(label), Some(detail)) = (
-                    item.get("label").and_then(serde_json::Value::as_str),
-                    item.get("detail").and_then(serde_json::Value::as_str),
-                ) {
-                    map.insert(label.to_string(), detail.to_string());
-                }
-            }
-        }
-        map
-    }
-}
-
-impl Drop for Lsp {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
     }
 }
 
@@ -241,7 +118,130 @@ fn infer_return_type(path: &Path, line: usize, column: usize) -> Option<String> 
     finder.ty
 }
 
+/// 收集文件内所有 `let name: Type = ...` 的类型标注，作为捕获类型的 fallback。
+fn infer_let_types(path: &Path) -> HashMap<String, String> {
+    #[derive(Default)]
+    struct Finder {
+        types: HashMap<String, String>,
+    }
+    impl<'ast> Visit<'ast> for Finder {
+        fn visit_local(&mut self, local: &'ast syn::Local) {
+            if let syn::Pat::Type(pat) = &local.pat {
+                let name = match &*pat.pat {
+                    syn::Pat::Ident(id) => Some(id.ident.to_string()),
+                    _ => None,
+                };
+                if let Some(name) = name {
+                    let ty = &pat.ty;
+                    self.types
+                        .entry(name)
+                        .or_insert_with(|| quote::quote!(#ty).to_string());
+                }
+            }
+            visit::visit_local(self, local);
+        }
+    }
+
+    let Ok(src) = fs::read_to_string(path) else {
+        return HashMap::new();
+    };
+    let Ok(file) = syn::parse_file(&src) else {
+        return HashMap::new();
+    };
+    let mut finder = Finder::default();
+    finder.visit_file(&file);
+    finder.types
+}
+
+/// 解析 `c!` 宏体开头的可选签名：`(name: RustType, ...) -> RustType`
+///
+/// 签名必须先于 C 语句；两部分各自可选。返回去掉签名后的 C token。
+fn parse_signature(ts: TokenStream2) -> (Signature, TokenStream2) {
+    let tokens: Vec<TokenTree> = ts.into_iter().collect();
+    let mut i = 0usize;
+    let mut captures = Vec::new();
+
+    if matches!(tokens.get(i), Some(TokenTree::Group(g)) if g.delimiter() == Delimiter::Parenthesis) {
+        let TokenTree::Group(g) = &tokens[i] else { unreachable!() };
+        for part in split_commas(&g.stream()) {
+            let colon = part
+                .iter()
+                .position(|t| matches!(t, TokenTree::Punct(p) if p.as_char() == ':'))
+                .unwrap_or_else(|| panic!("c! 捕获标注必须写成 `name: RustType`"));
+            let name = match &part[..colon] {
+                [TokenTree::Ident(id)] => id.to_string(),
+                _ => panic!("c! 捕获标注的变量名必须是单个标识符"),
+            };
+            let ty_tokens: TokenStream2 = part[colon + 1..].iter().cloned().collect();
+            let ty: syn::Type = syn::parse2(ty_tokens)
+                .unwrap_or_else(|e| panic!("c! 捕获 `{name}` 的类型不是合法 Rust 类型: {e}"));
+            captures.push((name, quote::quote!(#ty).to_string()));
+        }
+        i += 1;
+    }
+
+    let mut ret = None;
+    if matches!(
+        (tokens.get(i), tokens.get(i + 1)),
+        (Some(TokenTree::Punct(a)), Some(TokenTree::Punct(b)))
+            if a.as_char() == '-' && b.as_char() == '>'
+    ) {
+        let start = i + 2;
+        let mut found = None;
+        for end in (start + 1..=tokens.len()).rev() {
+            let candidate: TokenStream2 = tokens[start..end].iter().cloned().collect();
+            if let Ok(ty) = syn::parse2::<syn::Type>(candidate) {
+                found = Some((end, quote::quote!(#ty).to_string()));
+                break;
+            }
+        }
+        let (end, ty) = found.unwrap_or_else(|| panic!("`->` 后必须是合法的 Rust 返回类型"));
+        ret = Some(ty);
+        i = end;
+    }
+
+    let body = tokens[i..].iter().cloned().collect();
+    (
+        Signature {
+            captures,
+            ret,
+        },
+        body,
+    )
+}
+
+/// 按顶层逗号切分 token（忽略 Group 内部与 `<...>` 里的逗号）。
+fn split_commas(ts: &TokenStream2) -> Vec<Vec<TokenTree>> {
+    let mut parts = vec![Vec::new()];
+    let mut angle = 0i32;
+    for tt in ts.clone() {
+        match &tt {
+            TokenTree::Group(_) => parts.last_mut().unwrap().push(tt),
+            TokenTree::Punct(p) if p.as_char() == '<' => {
+                angle += 1;
+                parts.last_mut().unwrap().push(tt);
+            }
+            TokenTree::Punct(p) if p.as_char() == '>' => {
+                angle = (angle - 1).max(0);
+                parts.last_mut().unwrap().push(tt);
+            }
+            TokenTree::Punct(p) if p.as_char() == ',' && angle == 0 => {
+                parts.push(Vec::new());
+            }
+            _ => parts.last_mut().unwrap().push(tt),
+        }
+    }
+    parts.retain(|p| !p.is_empty());
+    parts
+}
+
 fn rust_type_to_c(t: &str) -> String {
+    let t = t
+        .trim()
+        .replace("* mut ", "*mut ")
+        .replace("* const ", "*const ")
+        .replace("& mut ", "&mut ")
+        .replace("& ", "&");
     let t = t.trim();
     match t {
         "i8" => "int8_t".into(),
@@ -345,9 +345,9 @@ fn augment_body(body: &str, names: &[(String, bool)], types: &HashMap<String, St
     for (name, mutable) in names {
         let ty = types.get(name).unwrap_or_else(|| {
             panic!(
-                "rust-analyzer cannot resolve the type of captured variable `{}`; \
-                 generate any Rust bindings it uses before calling ya_c_inline_build::setup()",
-                name
+                "cannot resolve the type of captured variable `{}`; write \
+                 `c!{{ ({}: RustType) ... }}` or add a Rust `let` type annotation",
+                name, name
             )
         });
         let c_ty = rust_type_to_c(ty);
@@ -452,31 +452,41 @@ fn setup_with(always_inline: bool) {
     fs::write(yaci.join("yaci_cmod_decls.h"), declarations).unwrap();
 
     let stmt_macros = dedup_stmts(collector.stmts);
-    let mut lsp = None;
     for stmt in &stmt_macros {
         let h = hash(&stmt.key);
         let names = discover_capture_names(&stmt.source, &stmts);
         let mut body = if names.is_empty() {
             stmt.source.clone()
         } else {
-            let lsp = lsp.get_or_insert_with(|| {
-                let mut lsp = Lsp::new(&manifest);
-                for (path, text) in &collector.files {
-                    lsp.did_open(path, text);
+            // 优先级：显式签名 > syn 解析 let 标注 > 报错
+            let mut types: HashMap<String, String> = stmt
+                .sig
+                .captures
+                .iter()
+                .cloned()
+                .collect();
+            let let_types = infer_let_types(&stmt.file);
+            for (name, _) in &names {
+                if !types.contains_key(name) {
+                    if let Some(ty) = let_types.get(name) {
+                        types.insert(name.clone(), ty.clone());
+                    }
                 }
-                std::thread::sleep(std::time::Duration::from_millis(300));
-                lsp
-            });
-            let types = lsp.completion_types(&stmt.file, stmt.line, stmt.column);
+            }
             augment_body(&stmt.source, &names, &types)
         };
-        let ret_ty = infer_return_type(&stmt.file, stmt.line, stmt.column);
+        // 返回类型：显式签名 > let 标注 > 报错
+        let ret_ty = stmt
+            .sig
+            .ret
+            .clone()
+            .or_else(|| infer_return_type(&stmt.file, stmt.line, stmt.column));
         if let Some(ty) = ret_ty {
             body = format!("YACI_RETURN({});\n{}", rust_type_to_c(&ty), body);
         } else if body.contains("return") {
             panic!(
-                "cannot infer c! return type; add an explicit Rust type annotation \
-                 to the let-binding and rebuild"
+                "cannot infer c! return type; write `c!{{ -> Type ... }}` or add an \
+                 explicit Rust type annotation to the let-binding"
             );
         }
         generate_stmt(&yaci, &stmts, &h, &body, always_inline);
@@ -504,7 +514,6 @@ fn collect_macros(dir: &Path, collector: &mut Collector) {
             let src = fs::read_to_string(&path).unwrap();
             let file = syn::parse_file(&src)
                 .unwrap_or_else(|e| panic!("failed to parse {}: {}", path.display(), e));
-            collector.files.push((path.clone(), src));
             collector.file = path.clone();
             collector.visit_file(&file);
         }
