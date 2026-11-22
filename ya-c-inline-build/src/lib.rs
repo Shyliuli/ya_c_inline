@@ -60,7 +60,10 @@ impl<'ast> Visit<'ast> for Collector {
                 m.tokens.clone(),
             )
         };
-        let source = normalize_c(&tokens_to_c(body_tokens));
+        let mut source = String::new();
+        let mut line = body_tokens.span().start().line;
+        tokens_to_c(body_tokens, &mut line, &mut source);
+        let source = normalize_c(&source);
         match name.as_str() {
             "cinclude" => self.includes.push(source),
             "cmod" => self.cmods.push((key, source)),
@@ -266,14 +269,28 @@ fn rust_type_to_c(t: &str) -> String {
     }
 }
 
-fn discover_capture_names(body: &str, dir: &Path) -> Vec<(String, bool)> {
+fn capture_written(node: &serde_json::Value, id: &str, write: bool) -> bool {
+    let write_operand = match node["kind"].as_str() {
+        Some("BinaryOperator") => node["opcode"] == "=",
+        Some("CompoundAssignOperator") => true,
+        Some("UnaryOperator") => matches!(node["opcode"].as_str(), Some("++" | "--" | "&")),
+        Some("ParenExpr") => write,
+        Some("MemberExpr") => write && node["isArrow"] == false,
+        Some("DeclRefExpr") => return write && node["referencedDecl"]["id"] == id,
+        _ => false,
+    };
+    node["inner"].as_array().into_iter().flatten().enumerate()
+        .any(|(index, child)| capture_written(child, id, write_operand && index == 0))
+}
+
+fn discover_capture_names(body: &str, dir: &Path, types: &HashMap<String, String>) -> Vec<(String, bool)> {
     let undeclared = Regex::new(r"use of undeclared identifier '([A-Za-z_]\w*)'").unwrap();
     let mut declared: Vec<String> = Vec::new();
     let mut ast = String::new();
     for _ in 0..8 {
         let decls = declared
             .iter()
-            .map(|n| format!("int {};\n", n))
+            .map(|name| format!("{} {name};\n", rust_type_to_c(types.get(name).map_or("i32", String::as_str))))
             .collect::<String>();
         let probe = dir.join("__yaci_names.c");
         fs::write(
@@ -286,7 +303,7 @@ fn discover_capture_names(body: &str, dir: &Path) -> Vec<(String, bool)> {
         .unwrap();
         let output = Command::new(clang())
             .arg("-Xclang")
-            .arg("-ast-dump")
+            .arg("-ast-dump=json")
             .arg("-Xclang")
             .arg("-ast-dump-filter=__yaci_names")
             .arg("-fsyntax-only")
@@ -300,10 +317,7 @@ fn discover_capture_names(body: &str, dir: &Path) -> Vec<(String, bool)> {
         let mut fresh = Vec::new();
         for caps in undeclared.captures_iter(&stderr) {
             let name = caps[1].to_string();
-            let is_call = Regex::new(&format!(r"{}\s*\(", regex::escape(&name)))
-                .unwrap()
-                .is_match(body);
-            if !declared.contains(&name) && !is_call && !fresh.contains(&name) {
+            if !declared.contains(&name) && !fresh.contains(&name) {
                 fresh.push(name);
             }
         }
@@ -314,27 +328,11 @@ fn discover_capture_names(body: &str, dir: &Path) -> Vec<(String, bool)> {
         declared.extend(fresh);
     }
 
-    let lines: Vec<&str> = ast.lines().collect();
+    let ast: serde_json::Value = serde_json::from_str(&ast).expect("invalid Clang capture AST");
     let mut result = Vec::new();
-    for name in declared {
-        let mut mutable = false;
-        for (i, line) in lines.iter().enumerate() {
-            if !line.contains("DeclRefExpr") || !line.contains(&format!("'{}'", name)) {
-                continue;
-            }
-            let start = i.saturating_sub(5);
-            let end = (i + 6).min(lines.len());
-            let ctx = lines[start..end].join("\n");
-            let assigned = ctx.contains("BinaryOperator")
-                && ["'='", "'+='", "'-='", "'*='", "'/='", "'%='"]
-                    .iter()
-                    .any(|op| ctx.contains(op));
-            let incremented = ctx.contains("UnaryOperator")
-                && (ctx.contains("'++'") || ctx.contains("'--'"));
-            if assigned || incremented {
-                mutable = true;
-            }
-        }
+    let statements = ast["inner"][0]["inner"].as_array().unwrap();
+    for (name, decl) in declared.into_iter().zip(statements) {
+        let mutable = capture_written(&ast, decl["inner"][0]["id"].as_str().unwrap(), false);
         result.push((name, mutable));
     }
     result
@@ -452,10 +450,7 @@ fn setup_with(always_inline: bool) {
     let stmt_macros = dedup_stmts(collector.stmts);
     for stmt in &stmt_macros {
         let h = hash(&stmt.key);
-        let names = discover_capture_names(&stmt.source, &stmts);
-        let mut body = if names.is_empty() {
-            stmt.source.clone()
-        } else {
+        let mut body = {
             // 优先级：显式签名 > syn 解析 let 标注 > 报错
             let mut types: HashMap<String, String> = stmt
                 .sig
@@ -464,13 +459,8 @@ fn setup_with(always_inline: bool) {
                 .cloned()
                 .collect();
             let let_types = infer_let_types(&stmt.file);
-            for (name, _) in &names {
-                if !types.contains_key(name) {
-                    if let Some(ty) = let_types.get(name) {
-                        types.insert(name.clone(), ty.clone());
-                    }
-                }
-            }
+            types = let_types.into_iter().chain(types).collect();
+            let names = discover_capture_names(&stmt.source, &stmts, &types);
             augment_body(&stmt.source, &names, &types)
         };
         // 返回类型：显式签名 > let 标注 > 报错
@@ -598,7 +588,7 @@ fn dependencies(depfile: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-fn tokens_to_c(ts: TokenStream2) -> String {
+fn tokens_to_c(ts: TokenStream2, line: &mut usize, out: &mut String) {
     fn is_word(c: char) -> bool {
         c.is_alphanumeric() || c == '_'
     }
@@ -611,12 +601,10 @@ fn tokens_to_c(ts: TokenStream2) -> String {
         }
     }
 
-    let mut out = String::new();
-    let mut line = 1usize;
     for tt in ts {
         let start_line = tt.span().start().line;
         let end_line = tt.span().end().line;
-        newline_to(start_line, &mut line, &mut out);
+        newline_to(start_line, line, out);
         match tt {
             TokenTree::Ident(id) => {
                 if out.chars().last().map(is_word).unwrap_or(false) {
@@ -658,18 +646,13 @@ fn tokens_to_c(ts: TokenStream2) -> String {
                     out.push(' ');
                 }
                 out.push(open);
-                newline_to(g.span().start().line, &mut line, &mut out);
-                let inner = tokens_to_c(g.stream());
-                if !inner.is_empty() {
-                    out.push_str(&inner);
-                }
-                newline_to(g.span().end().line, &mut line, &mut out);
+                tokens_to_c(g.stream(), line, out);
+                newline_to(end_line, line, out);
                 out.push(close);
             }
         }
-        line = line.max(end_line);
+        *line = (*line).max(end_line);
     }
-    out
 }
 
 /// proc_macro2 的 to_string 会丢掉换行；在预处理指令前补回换行。
@@ -1072,15 +1055,15 @@ fn generate_stmt(yaci: &Path, stmts: &Path, h: &str, body: &str, always_inline: 
     let mut defs = String::new();
     let mut undefs = String::new();
     for (i, cap) in captures.iter().enumerate() {
-        let base = cap.ctype.trim_start_matches("const ").trim();
+        let base = &cap.ctype;
         if cap.mutable {
             params.push(format!("{} *p{}", base, i));
             rust_params.push(format!("p{}: *mut ()", i));
             args.push(format!("&raw mut {} as *mut ()", cap.name));
         } else {
-            params.push(format!("const {} *p{}", base, i));
+            params.push(format!("{} const *p{}", base, i));
             rust_params.push(format!("p{}: *const ()", i));
-            args.push(format!("&raw const {} as *const ()", cap.name));
+            args.push(format!("&{} as *const _ as *const ()", cap.name));
         }
         defs.push_str(&format!("#define {} (*p{})\n", cap.name, i));
         undefs.push_str(&format!("#undef {}\n", cap.name));
