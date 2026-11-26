@@ -9,5 +9,4 @@ license = "MIT OR Apache-2.0"
 syn = { version = "2", features = ["full", "visit"] }
 proc-macro2 = { version = "1", features = ["span-locations"] }
 quote = "1"
-regex = "1"
 serde_json = "1"
