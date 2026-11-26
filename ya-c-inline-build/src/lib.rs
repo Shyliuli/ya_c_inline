@@ -132,6 +132,7 @@ impl<'ast> Visit<'ast> for FileScanner {
 
 pub struct Builder {
     always_inline: bool,
+    clang_args: Vec<String>,
 }
 
 impl Default for Builder {
@@ -142,7 +143,10 @@ impl Default for Builder {
 
 impl Builder {
     pub fn new() -> Self {
-        Self { always_inline: false }
+        Self {
+            always_inline: false,
+            clang_args: Vec::new(),
+        }
     }
 
     /// 启用实验性 always-inline：把 c! 桩函数编译为 LLVM bitcode 并交给 LTO。
@@ -152,8 +156,22 @@ impl Builder {
         self
     }
 
+    pub fn clang_arg(mut self, arg: impl Into<String>) -> Self {
+        self.clang_args.push(arg.into());
+        self
+    }
+
+    pub fn clang_args<I, S>(mut self, args: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.clang_args.extend(args.into_iter().map(Into::into));
+        self
+    }
+
     pub fn setup(self) {
-        setup_with(self.always_inline);
+        setup_with(self.always_inline, &self.clang_args);
     }
 }
 
@@ -161,7 +179,7 @@ pub fn setup() {
     Builder::new().setup();
 }
 
-fn setup_with(always_inline: bool) {
+fn setup_with(always_inline: bool, clang_args: &[String]) {
     let manifest = PathBuf::from(
         env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is set by cargo"),
     );
@@ -192,6 +210,9 @@ fn setup_with(always_inline: bool) {
         ),
     );
 
+    let cflags_path = yaci.join("cflags.stamp");
+    write_if_changed(&cflags_path, &clang_args.join("\n"));
+
     let cmods = dedup_mods(collected.cmods);
     let mut declarations = String::from("#pragma once\n");
     for m in &cmods {
@@ -207,13 +228,13 @@ fn setup_with(always_inline: bool) {
 
         let lib = format!("yaci_m_{}", h);
         let depfile = yaci.join(format!("{}.d", lib));
-        compile_static(&yaci, &out, &lib, &csrc, &[&csrc, &includes_path]);
+        compile_static(&yaci, &out, &lib, &csrc, &[&csrc, &includes_path, &cflags_path], clang_args);
 
         let decls_file = mods.join(format!("{}.decls.h", h));
-        let decls = if is_fresh(&decls_file, &out, &[&csrc, &includes_path], &depfile) {
+        let decls = if is_fresh(&decls_file, &out, &[&csrc, &includes_path, &cflags_path], &depfile) {
             fs::read_to_string(&decls_file).unwrap()
         } else {
-            let decls = cmod_declarations(&yaci, &csrc, &source);
+            let decls = cmod_declarations(&yaci, &csrc, &source, clang_args);
             write_if_changed(&decls_file, &decls);
             decls
         };
@@ -225,7 +246,16 @@ fn setup_with(always_inline: bool) {
     write_if_changed(&cmod_decls_path, &declarations);
 
     for stmt in dedup_stmts(collected.stmts) {
-        process_stmt(&yaci, &out, &stmts, &includes_path, &cmod_decls_path, &stmt, always_inline);
+        process_stmt(
+            &yaci,
+            &out,
+            &stmts,
+            &includes_path,
+            &cmod_decls_path,
+            &stmt,
+            always_inline,
+            clang_args,
+        );
     }
 }
 
@@ -273,6 +303,7 @@ fn process_stmt(
     cmod_decls_path: &Path,
     stmt: &StmtMacro,
     always_inline: bool,
+    clang_args: &[String],
 ) {
     let h = hash(&stmt.key);
     let ret_rust = stmt.sig.ret.clone().or_else(|| stmt.inferred_ret.clone());
@@ -296,7 +327,7 @@ fn process_stmt(
     }
 
     let meta_path = stmts.join(format!("{}.meta", h));
-    write_if_changed(&meta_path, &build_stmt_meta(stmt, ret_rust_str, always_inline));
+    write_if_changed(&meta_path, &build_stmt_meta(stmt, ret_rust_str, always_inline, clang_args));
 
     let rs_path = stmts.join(format!("{}.rs", h));
     let lib = format!("yaci_s_{}", h);
@@ -319,7 +350,7 @@ fn process_stmt(
         return;
     }
 
-    let captures = discover_captures(stmt, &ret_c, stmts, &types);
+    let captures = discover_captures(stmt, &ret_c, stmts, &types, clang_args);
 
     let mut params = Vec::new();
     let mut rust_params = Vec::new();
@@ -373,11 +404,12 @@ fn process_stmt(
             cmod_decls_path,
             &rust_params,
             ret_rust_str,
+            clang_args,
         );
         println!("cargo:rustc-link-arg={}", object.display());
         (String::new(), format!("__yaci_rust_{}", h))
     } else {
-        compile_static(yaci, out_dir, &lib, &csrc, &[&csrc, includes_path, cmod_decls_path]);
+        compile_static(yaci, out_dir, &lib, &csrc, &[&csrc, includes_path, cmod_decls_path], clang_args);
         println!("cargo:rustc-link-lib=static={}", lib);
         (
             format!("    #[link(name = \"{}\", kind = \"static\")]\n", lib),
@@ -399,8 +431,11 @@ fn process_stmt(
     );
 }
 
-fn build_stmt_meta(stmt: &StmtMacro, ret_rust: &str, always_inline: bool) -> String {
+fn build_stmt_meta(stmt: &StmtMacro, ret_rust: &str, always_inline: bool, clang_args: &[String]) -> String {
     let mut meta = format!("always_inline={always_inline}\nret={ret_rust}\n");
+    for arg in clang_args {
+        meta.push_str(&format!("cflag:{arg}\n"));
+    }
     for (name, ty) in &stmt.sig.captures {
         meta.push_str(&format!("sig:{name}={ty}\n"));
     }
@@ -428,6 +463,7 @@ fn discover_captures(
     ret_c: &str,
     stmts_dir: &Path,
     types: &HashMap<String, String>,
+    clang_args: &[String],
 ) -> Vec<(String, String, bool)> {
     let mut declared: Vec<String> = stmt.sig.captures.iter().map(|(n, _)| n.clone()).collect();
     let probe = stmts_dir.join("__yaci_probe.c");
@@ -452,6 +488,7 @@ fn discover_captures(
         .unwrap();
 
         let output = Command::new(clang())
+            .args(clang_args)
             .args([
                 "-Xclang",
                 "-ast-dump=json",
@@ -916,9 +953,10 @@ fn run(mut cmd: Command, what: &str) -> Output {
     output
 }
 
-fn cmod_declarations(dir: &Path, csrc: &Path, source: &str) -> String {
+fn cmod_declarations(dir: &Path, csrc: &Path, source: &str, clang_args: &[String]) -> String {
     let mut cmd = Command::new(clang());
-    cmd.args(["-Xclang", "-ast-dump=json", "-fsyntax-only", "-I"])
+    cmd.args(clang_args)
+        .args(["-Xclang", "-ast-dump=json", "-fsyntax-only", "-I"])
         .arg(dir)
         .arg(csrc);
     let output = run(cmd, "clang AST dump for cmod!");
@@ -957,7 +995,14 @@ fn cmod_declarations(dir: &Path, csrc: &Path, source: &str) -> String {
     declarations
 }
 
-fn compile_static(dir: &Path, out_dir: &Path, lib: &str, csrc: &Path, inputs: &[&Path]) {
+fn compile_static(
+    dir: &Path,
+    out_dir: &Path,
+    lib: &str,
+    csrc: &Path,
+    inputs: &[&Path],
+    clang_args: &[String],
+) {
     let obj = dir.join(format!("{}.o", lib));
     let archive = dir.join(format!("lib{}.a", lib));
     let depfile = dir.join(format!("{}.d", lib));
@@ -967,7 +1012,8 @@ fn compile_static(dir: &Path, out_dir: &Path, lib: &str, csrc: &Path, inputs: &[
     run(
         {
             let mut cmd = Command::new(clang());
-            cmd.args(["-O2", "-fPIC", "-MMD", "-MF"])
+            cmd.args(clang_args)
+                .args(["-O2", "-fPIC", "-MMD", "-MF"])
                 .arg(&depfile)
                 .arg("-c")
                 .arg(csrc)
@@ -996,6 +1042,7 @@ fn compile_bitcode(
     csrc: &Path,
     includes: &Path,
     declarations: &Path,
+    clang_args: &[String],
 ) -> PathBuf {
     let bc = dir.join(format!("{}.bc", name));
     let depfile = dir.join(format!("{}.d", name));
@@ -1005,7 +1052,8 @@ fn compile_bitcode(
     run(
         {
             let mut cmd = Command::new(clang());
-            cmd.args(["-O2", "-flto", "-emit-llvm", "-MMD", "-MF"])
+            cmd.args(clang_args)
+                .args(["-O2", "-flto", "-emit-llvm", "-MMD", "-MF"])
                 .arg(&depfile)
                 .arg("-c")
                 .arg(csrc)
@@ -1031,8 +1079,17 @@ fn compile_inlined_wrapper(
     declarations: &Path,
     rust_params: &[String],
     ret_rust: &str,
+    clang_args: &[String],
 ) -> PathBuf {
-    let c_bc = compile_bitcode(yaci, out_dir, &format!("yaci_s_{}", h), csrc, includes, declarations);
+    let c_bc = compile_bitcode(
+        yaci,
+        out_dir,
+        &format!("yaci_s_{}", h),
+        csrc,
+        includes,
+        declarations,
+        clang_args,
+    );
     let names = rust_params
         .iter()
         .map(|p| p.split(':').next().unwrap().trim().to_string())
